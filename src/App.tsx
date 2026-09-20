@@ -538,13 +538,19 @@ function App() {
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-slate-300">Waveform</h2>
             <span className="text-xs text-slate-500">
-              Drag to select • Scroll to zoom • Click to seek • Drag pins to adjust
+              Drag to select • Double-click to clear • Scroll to zoom • Drag pins to adjust
             </span>
           </div>
           
           <div
             ref={waveformRef}
             className="relative rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50"
+            onDoubleClick={() => {
+              if (pendingRegion) {
+                cancelPendingRegion();
+                showNotification('Selection cleared');
+              }
+            }}
           >
             {/* Pins and highlight overlay - inside waveform container so they scroll/zoom with it */}
             {pendingRegion && isReady && (
@@ -568,6 +574,9 @@ function App() {
                     e.stopPropagation();
                     handlePinDragStart('start');
                   }}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                  }}
                 >
                   <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
                   <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
@@ -584,6 +593,9 @@ function App() {
                     e.preventDefault();
                     e.stopPropagation();
                     handlePinDragStart('end');
+                  }}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
                   }}
                 >
                   <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
@@ -810,7 +822,7 @@ function App() {
 
         <div className="bg-slate-800/30 rounded-xl border border-slate-700/30 p-4">
           <h3 className="text-sm font-medium text-slate-400 mb-3">How to use</h3>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs text-slate-500">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4 text-xs text-slate-500">
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">1.</span>
               <span>Drag on waveform to select a region</span>
@@ -825,6 +837,10 @@ function App() {
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">4.</span>
+              <span>Double-click to clear current selection</span>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="text-indigo-400 font-bold">5.</span>
               <span>Export as WAV or MP3</span>
             </div>
           </div>
