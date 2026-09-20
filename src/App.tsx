@@ -138,6 +138,7 @@ function App() {
       barRadius: 2,
       normalize: true,
       minPxPerSec: 1,
+      interact: true, // Enable click-to-seek
     });
 
     const regionsPlugin = RegionsPlugin.create();
@@ -303,7 +304,7 @@ function App() {
     }
   }, [pinDragging, handlePinDrag, handlePinDragEnd]);
 
-  // Scroll wheel zoom
+  // Scroll wheel zoom and scroll sync
   useEffect(() => {
     const container = waveformContainerRef.current;
     if (!container) return;
@@ -317,11 +318,26 @@ function App() {
       
       if (wavesurferRef.current) {
         wavesurferRef.current.zoom(newZoom);
+        // Force re-render to update pin positions after DOM updates
+        setTimeout(() => {
+          requestAnimationFrame(() => {
+            forceUpdate(n => n + 1);
+          });
+        }, 100);
       }
     };
 
+    // Sync pins when scrolling
+    const handleScroll = () => {
+      forceUpdate(n => n + 1);
+    };
+
     container.addEventListener('wheel', handleWheel, { passive: false });
-    return () => container.removeEventListener('wheel', handleWheel);
+    container.addEventListener('scroll', handleScroll);
+    return () => {
+      container.removeEventListener('wheel', handleWheel);
+      container.removeEventListener('scroll', handleScroll);
+    };
   }, [zoom]);
 
   const handleFileSelect = useCallback((file: File) => {
@@ -382,6 +398,13 @@ function App() {
     setZoom(value);
     if (wavesurferRef.current) {
       wavesurferRef.current.zoom(value);
+      // Force re-render to update pin positions after DOM updates
+      // Use multiple frames to ensure DOM has fully updated
+      setTimeout(() => {
+        requestAnimationFrame(() => {
+          forceUpdate(n => n + 1);
+        });
+      }, 100);
     }
   }, []);
 
@@ -478,15 +501,14 @@ function App() {
     };
   }, []);
 
-  // Calculate pin positions
+  // Calculate pin positions - relative to waveform content (not visible area)
   const getPinPosition = useCallback((time: number) => {
     if (!waveformContainerRef.current || !wavesurferRef.current) return 0;
     const container = waveformContainerRef.current;
     const totalWidth = container.scrollWidth;
-    const scrollLeft = container.scrollLeft;
     const duration = wavesurferRef.current.getDuration();
-    const position = (time / duration) * totalWidth - scrollLeft;
-    return Math.max(0, Math.min(container.clientWidth, position));
+    const position = (time / duration) * totalWidth;
+    return position;
   }, []);
 
   // Drop zone UI (when no file loaded)
@@ -595,38 +617,52 @@ function App() {
             </span>
           </div>
           
-          {/* Pins overlay */}
+          {/* Pins overlay - positioned above waveform but synced with scroll */}
           {pendingRegion && isReady && (
-            <div className="relative h-8 mb-2">
-              {/* Start pin */}
-              <div
-                className="absolute top-0 w-6 h-8 cursor-ew-resize select-none"
-                style={{ left: `${getPinPosition(pendingRegion.start) - 12}px` }}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  handlePinDragStart('start');
+            <div 
+              className="relative h-8 mb-2 overflow-hidden"
+              style={{ 
+                width: waveformContainerRef.current?.clientWidth || '100%',
+              }}
+            >
+              {/* Pins container - matches waveform content width */}
+              <div 
+                className="absolute top-0 h-full"
+                style={{ 
+                  width: waveformContainerRef.current?.scrollWidth || '100%',
+                  transform: `translateX(-${waveformContainerRef.current?.scrollLeft || 0}px)`,
                 }}
               >
-                <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
-                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
-                <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
-                  {formatTime(pendingRegion.start)}
+                {/* Start pin */}
+                <div
+                  className="absolute top-0 w-6 h-8 cursor-ew-resize select-none"
+                  style={{ left: `${getPinPosition(pendingRegion.start) - 12}px` }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    handlePinDragStart('start');
+                  }}
+                >
+                  <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
+                  <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
+                  <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
+                    {formatTime(pendingRegion.start)}
+                  </div>
                 </div>
-              </div>
-              
-              {/* End pin */}
-              <div
-                className="absolute top-0 w-6 h-8 cursor-ew-resize select-none"
-                style={{ left: `${getPinPosition(pendingRegion.end) - 12}px` }}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  handlePinDragStart('end');
-                }}
-              >
-                <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
-                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
-                <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
-                  {formatTime(pendingRegion.end)}
+                
+                {/* End pin */}
+                <div
+                  className="absolute top-0 w-6 h-8 cursor-ew-resize select-none"
+                  style={{ left: `${getPinPosition(pendingRegion.end) - 12}px` }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    handlePinDragStart('end');
+                  }}
+                >
+                  <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
+                  <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
+                  <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
+                    {formatTime(pendingRegion.end)}
+                  </div>
                 </div>
               </div>
             </div>
