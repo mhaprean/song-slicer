@@ -44,6 +44,7 @@ function App() {
 
   const waveformRef = useRef<HTMLDivElement>(null);
   const waveformContainerRef = useRef<HTMLDivElement>(null);
+  const waveformSectionRef = useRef<HTMLDivElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
   const regionsPluginRef = useRef<RegionsPlugin | null>(null);
   const audioBufferRef = useRef<AudioBuffer | null>(null);
@@ -307,23 +308,23 @@ function App() {
   // Scroll wheel zoom and scroll sync
   useEffect(() => {
     const container = waveformContainerRef.current;
+    const section = waveformSectionRef.current;
     if (!container) return;
 
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
+      e.stopPropagation();
       
-      const delta = e.deltaY > 0 ? -50 : 50;
-      const newZoom = Math.max(0, Math.min(500, zoom + delta));
+      const delta = e.deltaY > 0 ? -25 : 25;
+      const newZoom = Math.max(0, Math.min(1000, zoom + delta));
       setZoom(newZoom);
       
       if (wavesurferRef.current) {
         wavesurferRef.current.zoom(newZoom);
         // Force re-render to update pin positions after DOM updates
-        setTimeout(() => {
-          requestAnimationFrame(() => {
-            forceUpdate(n => n + 1);
-          });
-        }, 100);
+        requestAnimationFrame(() => {
+          forceUpdate(n => n + 1);
+        });
       }
     };
 
@@ -334,9 +335,18 @@ function App() {
 
     container.addEventListener('wheel', handleWheel, { passive: false });
     container.addEventListener('scroll', handleScroll);
+    
+    // Also attach to section wrapper for better UX
+    if (section) {
+      section.addEventListener('wheel', handleWheel, { passive: false });
+    }
+    
     return () => {
       container.removeEventListener('wheel', handleWheel);
       container.removeEventListener('scroll', handleScroll);
+      if (section) {
+        section.removeEventListener('wheel', handleWheel);
+      }
     };
   }, [zoom]);
 
@@ -511,6 +521,15 @@ function App() {
     return position;
   }, []);
 
+  // Check if there's enough space to show time labels
+  const hasEnoughSpaceForLabels = useCallback(() => {
+    if (!pendingRegion) return false;
+    const startPos = getPinPosition(pendingRegion.start);
+    const endPos = getPinPosition(pendingRegion.end);
+    const distance = endPos - startPos;
+    return distance > 100; // Need at least 100px between pins
+  }, [pendingRegion, getPinPosition]);
+
   // Drop zone UI (when no file loaded)
   if (!audioFile) {
     return (
@@ -609,7 +628,7 @@ function App() {
         </div>
 
         {/* Waveform with pins */}
-        <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4">
+        <div ref={waveformSectionRef} className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-slate-300">Waveform</h2>
             <span className="text-xs text-slate-500">
@@ -647,6 +666,12 @@ function App() {
                   <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
                     {formatTime(pendingRegion.start)}
                   </div>
+                  {/* Time label next to pin when zoomed in */}
+                  {hasEnoughSpaceForLabels() && (
+                    <div className="absolute top-1/2 -translate-y-1/2 left-6 text-xs font-mono text-yellow-300 whitespace-nowrap bg-slate-900/80 px-1.5 py-0.5 rounded">
+                      {formatTime(pendingRegion.start)}
+                    </div>
+                  )}
                 </div>
                 
                 {/* End pin */}
@@ -663,6 +688,12 @@ function App() {
                   <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
                     {formatTime(pendingRegion.end)}
                   </div>
+                  {/* Time label next to pin when zoomed in */}
+                  {hasEnoughSpaceForLabels() && (
+                    <div className="absolute top-1/2 -translate-y-1/2 right-6 text-xs font-mono text-yellow-300 whitespace-nowrap bg-slate-900/80 px-1.5 py-0.5 rounded">
+                      {formatTime(pendingRegion.end)}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -671,7 +702,6 @@ function App() {
           <div
             ref={waveformContainerRef}
             className="relative rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50"
-            onScroll={() => forceUpdate(n => n + 1)}
           >
             <div
               ref={waveformRef}
