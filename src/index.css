@@ -50,6 +50,43 @@ input[type="range"]::-moz-range-thumb:hover {
   background: #818cf8;
 }
 
+/* Pin styling */
+.pin-handle {
+  transition: transform 0.1s ease-out;
+}
+
+.pin-handle:hover {
+  transform: scale(1.2);
+}
+
+.pin-handle:active {
+  transform: scale(0.95);
+}
+
+/* Waveform container */
+.waveform-container {
+  scrollbar-width: thin;
+  scrollbar-color: #475569 #1e293b;
+}
+
+.waveform-container::-webkit-scrollbar {
+  height: 8px;
+}
+
+.waveform-container::-webkit-scrollbar-track {
+  background: #1e293b;
+  border-radius: 4px;
+}
+
+.waveform-container::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 4px;
+}
+
+.waveform-container::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
 /* WaveSurfer region styling */
 [part~="region"] {
   border-radius: 4px;
@@ -101,4 +138,17 @@ input[type="range"]::-moz-range-thumb:hover {
 
 .animate-fadeIn {
   animation: fadeIn 0.3s ease-out;
+}
+
+/* Prevent text selection during drag */
+.select-none {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+/* Smooth transitions for interactive elements */
+button, .pin-handle {
+  transition: all 0.15s ease-out;
 }
