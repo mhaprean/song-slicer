@@ -38,6 +38,7 @@ function App() {
   const audioBufferRef = useRef<AudioBuffer | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const colorCounterRef = useRef(0);
 
   const showNotification = useCallback((msg: string) => {
     setNotification(msg);
@@ -48,20 +49,64 @@ function App() {
     // Clean up previous instance
     if (wavesurferRef.current) {
       wavesurferRef.current.destroy();
+      wavesurferRef.current = null;
     }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+    }
+
+    setIsReady(false);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
 
     const audioContext = new AudioContext();
     audioContextRef.current = audioContext;
 
-    // Decode audio file to get AudioBuffer
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    // Read file as ArrayBuffer
+    let rawBuffer: ArrayBuffer;
+    try {
+      rawBuffer = await file.arrayBuffer();
+    } catch (err) {
+      console.error('Failed to read file:', err);
+      showNotification('Failed to read audio file');
+      return;
+    }
+
+    // IMPORTANT: decodeAudioData detaches the ArrayBuffer, so we need a copy for wavesurfer
+    const bufferCopy = rawBuffer.slice(0);
+
+    // Decode audio file to get AudioBuffer for export
+    let audioBuffer: AudioBuffer;
+    try {
+      audioBuffer = await audioContext.decodeAudioData(rawBuffer);
+    } catch (err) {
+      console.error('Failed to decode audio:', err);
+      showNotification('Failed to decode audio file. The format may not be supported by your browser.');
+      return;
+    }
     audioBufferRef.current = audioBuffer;
 
-    // Create blob URL for wavesurfer
-    const blob = new Blob([arrayBuffer], { type: file.type || 'audio/mpeg' });
-    const url = URL.createObjectURL(blob);
+    // Create blob for wavesurfer from the copy
+    // Determine MIME type from file or extension
+    let mimeType = file.type;
+    if (!mimeType || mimeType === '') {
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      const mimeMap: Record<string, string> = {
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'ogg': 'audio/ogg',
+        'flac': 'audio/flac',
+        'm4a': 'audio/mp4',
+        'aac': 'audio/aac',
+        'webm': 'audio/webm',
+      };
+      mimeType = mimeMap[ext || ''] || 'audio/mpeg';
+    }
+    
+    const blob = new Blob([bufferCopy], { type: mimeType });
 
+    // Create wavesurfer instance
     const ws = WaveSurfer.create({
       container: waveformRef.current!,
       waveColor: '#6366f1',
@@ -74,7 +119,6 @@ function App() {
       barRadius: 2,
       normalize: true,
       minPxPerSec: 1,
-      url: url,
     });
 
     const regionsPlugin = RegionsPlugin.create();
@@ -86,10 +130,27 @@ function App() {
       color: REGION_COLORS[0],
     });
 
+    // Timeout to detect stuck loading
+    const loadTimeout = setTimeout(() => {
+      if (!wavesurferRef.current) return;
+      const dur = wavesurferRef.current.getDuration();
+      if (dur === 0) {
+        console.error('Loading timeout - wavesurfer did not become ready');
+        showNotification('Audio loading timed out. The file may be too large or corrupted.');
+      }
+    }, 15000);
+
     // Event handlers
     ws.on('ready', () => {
+      clearTimeout(loadTimeout);
       setIsReady(true);
       setDuration(ws.getDuration());
+    });
+
+    ws.on('error', (err: unknown) => {
+      clearTimeout(loadTimeout);
+      console.error('WaveSurfer error:', err);
+      showNotification('Error loading audio waveform. Try a different file.');
     });
 
     ws.on('play', () => setIsPlaying(true));
@@ -97,7 +158,8 @@ function App() {
     ws.on('timeupdate', (time: number) => setCurrentTime(time));
 
     regionsPlugin.on('region-created', (region) => {
-      const colorIdx = regions.length % REGION_COLORS.length;
+      const colorIdx = colorCounterRef.current % REGION_COLORS.length;
+      colorCounterRef.current++;
       const color = REGION_COLORS[colorIdx];
       region.setOptions({ color });
 
@@ -122,7 +184,15 @@ function App() {
     });
 
     wavesurferRef.current = ws;
-  }, [regions.length]);
+
+    // Load the audio blob directly
+    try {
+      await ws.loadBlob(blob);
+    } catch (err) {
+      console.error('WaveSurfer loadBlob error:', err);
+      showNotification('Failed to load audio into waveform');
+    }
+  }, [showNotification]);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|ogg|flac|m4a|aac|webm)$/i)) {
