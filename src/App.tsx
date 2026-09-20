@@ -38,6 +38,9 @@ function App() {
   const [exportFormat, setExportFormat] = useState<'wav' | 'mp3'>('wav');
   const [notification, setNotification] = useState<string | null>(null);
   const [pinDragging, setPinDragging] = useState<'start' | 'end' | null>(null);
+  const [loopPending, setLoopPending] = useState(true);
+  const loopPendingRef = useRef(true);
+  const [, forceUpdate] = useState(0);
 
   const waveformRef = useRef<HTMLDivElement>(null);
   const waveformContainerRef = useRef<HTMLDivElement>(null);
@@ -53,6 +56,11 @@ function App() {
     setNotification(msg);
     setTimeout(() => setNotification(null), 3000);
   }, []);
+
+  // Keep loopPendingRef in sync with state
+  useEffect(() => {
+    loopPendingRef.current = loopPending;
+  }, [loopPending]);
 
   const initWaveSurfer = useCallback(async (file: File) => {
     // Clean up previous instance
@@ -166,7 +174,18 @@ function App() {
 
     ws.on('play', () => setIsPlaying(true));
     ws.on('pause', () => setIsPlaying(false));
-    ws.on('timeupdate', (time: number) => setCurrentTime(time));
+    ws.on('timeupdate', (time: number) => {
+      setCurrentTime(time);
+      
+      // Loop pending region if enabled
+      const pending = pendingRegionRef.current;
+      if (pending && loopPendingRef.current && ws.isPlaying()) {
+        // If we've reached or passed the end of the pending region, seek back to start
+        if (time >= pending.end - 0.01) {
+          ws.setTime(pending.start);
+        }
+      }
+    });
 
     // When a region is created via drag, store it as pending
     regionsPlugin.on('region-created', (region) => {
@@ -339,7 +358,23 @@ function App() {
 
   const togglePlay = useCallback(() => {
     if (wavesurferRef.current) {
-      wavesurferRef.current.playPause();
+      const ws = wavesurferRef.current;
+      
+      // If there's a pending region and loop is enabled, play in loop
+      if (pendingRegionRef.current && loopPendingRef.current) {
+        const { start } = pendingRegionRef.current;
+        
+        // If currently playing, pause
+        if (ws.isPlaying()) {
+          ws.pause();
+        } else {
+          // Start playing from the pending region start (without end, so it doesn't auto-stop)
+          ws.play(start);
+        }
+      } else {
+        // Normal play/pause
+        ws.playPause();
+      }
     }
   }, []);
 
@@ -600,11 +635,23 @@ function App() {
           <div
             ref={waveformContainerRef}
             className="relative rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50"
+            onScroll={() => forceUpdate(n => n + 1)}
           >
             <div
               ref={waveformRef}
               className="min-w-full"
             />
+            {/* Pending region highlight overlay */}
+            {pendingRegion && isReady && (
+              <div
+                className="absolute top-0 bottom-0 pointer-events-none bg-yellow-400/20 border-l-2 border-r-2 border-yellow-400/50"
+                style={{
+                  left: `${getPinPosition(pendingRegion.start)}px`,
+                  width: `${getPinPosition(pendingRegion.end) - getPinPosition(pendingRegion.start)}px`,
+                  height: '100%',
+                }}
+              />
+            )}
           </div>
           
           {!isReady && (
@@ -665,6 +712,23 @@ function App() {
                 </svg>
               )}
             </button>
+
+            {/* Loop toggle */}
+            {pendingRegion && (
+              <button
+                onClick={() => setLoopPending(!loopPending)}
+                className={`w-10 h-10 flex items-center justify-center rounded-full transition-colors ${
+                  loopPending
+                    ? 'bg-yellow-500 hover:bg-yellow-400 text-slate-900'
+                    : 'bg-slate-700 hover:bg-slate-600 text-slate-300'
+                }`}
+                title={loopPending ? 'Loop enabled - click to disable' : 'Loop disabled - click to enable'}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </button>
+            )}
 
             {/* Time display */}
             <div className="flex items-center gap-2 font-mono text-sm">
