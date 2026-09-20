@@ -10,6 +10,11 @@ interface RegionInfo {
   color: string;
 }
 
+interface PendingRegion {
+  start: number;
+  end: number;
+}
+
 const REGION_COLORS = [
   'rgba(99, 102, 241, 0.4)',
   'rgba(16, 185, 129, 0.4)',
@@ -27,11 +32,12 @@ function App() {
   const [duration, setDuration] = useState(0);
   const [zoom, setZoom] = useState(0);
   const [regions, setRegions] = useState<RegionInfo[]>([]);
+  const [pendingRegion, setPendingRegion] = useState<PendingRegion | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportFormat, setExportFormat] = useState<'wav' | 'mp3'>('wav');
   const [notification, setNotification] = useState<string | null>(null);
-  const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
+  const [pinDragging, setPinDragging] = useState<'start' | 'end' | null>(null);
 
   const waveformRef = useRef<HTMLDivElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
@@ -40,7 +46,7 @@ function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const colorCounterRef = useRef(0);
-  const selectionRef = useRef<{ start: number; end: number } | null>(null);
+  const pendingRegionRef = useRef<PendingRegion | null>(null);
 
   const showNotification = useCallback((msg: string) => {
     setNotification(msg);
@@ -60,8 +66,8 @@ function App() {
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
-    setSelection(null);
-    selectionRef.current = null;
+    setPendingRegion(null);
+    pendingRegionRef.current = null;
 
     const audioContext = new AudioContext();
     audioContextRef.current = audioContext;
@@ -152,18 +158,18 @@ function App() {
     ws.on('timeupdate', (time: number) => {
       setCurrentTime(time);
       
-      const sel = selectionRef.current;
-      if (sel && ws.isPlaying()) {
-        if (time >= sel.end - 0.01) {
-          ws.setTime(sel.start);
+      const pending = pendingRegionRef.current;
+      if (pending && ws.isPlaying()) {
+        if (time >= pending.end - 0.01) {
+          ws.setTime(pending.start);
         }
       }
     });
 
     regionsPlugin.on('region-created', (region) => {
-      const sel = { start: region.start, end: region.end };
-      setSelection(sel);
-      selectionRef.current = sel;
+      const pending = { start: region.start, end: region.end };
+      setPendingRegion(pending);
+      pendingRegionRef.current = pending;
       setTimeout(() => region.remove(), 0);
     });
 
@@ -177,8 +183,8 @@ function App() {
     }
   }, [showNotification]);
 
-  const addSelection = useCallback(() => {
-    if (!selection) return;
+  const addPendingRegion = useCallback(() => {
+    if (!pendingRegion) return;
     
     const colorIdx = colorCounterRef.current % REGION_COLORS.length;
     colorCounterRef.current++;
@@ -186,21 +192,81 @@ function App() {
     
     const newRegion: RegionInfo = {
       id: `region-${Date.now()}`,
-      start: selection.start,
-      end: selection.end,
+      start: pendingRegion.start,
+      end: pendingRegion.end,
       color,
     };
     
     setRegions(prev => [...prev, newRegion]);
-    setSelection(null);
-    selectionRef.current = null;
+    setPendingRegion(null);
+    pendingRegionRef.current = null;
     showNotification('Selection added');
-  }, [selection, showNotification]);
+  }, [pendingRegion, showNotification]);
 
-  const cancelSelection = useCallback(() => {
-    setSelection(null);
-    selectionRef.current = null;
+  const cancelPendingRegion = useCallback(() => {
+    setPendingRegion(null);
+    pendingRegionRef.current = null;
   }, []);
+
+  const updatePendingRegion = useCallback((start?: number, end?: number) => {
+    if (!pendingRegionRef.current) return;
+    
+    const updated: PendingRegion = {
+      start: start !== undefined ? Math.max(0, start) : pendingRegionRef.current.start,
+      end: end !== undefined ? Math.min(duration, end) : pendingRegionRef.current.end,
+    };
+    
+    if (updated.start >= updated.end) {
+      if (start !== undefined) {
+        updated.start = updated.end - 0.01;
+      } else {
+        updated.end = updated.start + 0.01;
+      }
+    }
+    
+    pendingRegionRef.current = updated;
+    setPendingRegion(updated);
+  }, [duration]);
+
+  const handlePinDragStart = useCallback((pin: 'start' | 'end') => {
+    setPinDragging(pin);
+  }, []);
+
+  const handlePinDrag = useCallback((e: MouseEvent) => {
+    if (!pinDragging || !pendingRegionRef.current || !waveformRef.current) return;
+    
+    const ws = wavesurferRef.current;
+    if (!ws) return;
+    
+    const container = waveformRef.current;
+    const rect = container.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    
+    const scrollLeft = container.scrollLeft;
+    const totalWidth = container.scrollWidth;
+    const time = (x + scrollLeft) / totalWidth * ws.getDuration();
+    
+    if (pinDragging === 'start') {
+      updatePendingRegion(time, undefined);
+    } else {
+      updatePendingRegion(undefined, time);
+    }
+  }, [pinDragging, updatePendingRegion]);
+
+  const handlePinDragEnd = useCallback(() => {
+    setPinDragging(null);
+  }, []);
+
+  useEffect(() => {
+    if (pinDragging) {
+      window.addEventListener('mousemove', handlePinDrag);
+      window.addEventListener('mouseup', handlePinDragEnd);
+      return () => {
+        window.removeEventListener('mousemove', handlePinDrag);
+        window.removeEventListener('mouseup', handlePinDragEnd);
+      };
+    }
+  }, [pinDragging, handlePinDrag, handlePinDragEnd]);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|ogg|flac|m4a|aac|webm)$/i)) {
@@ -213,8 +279,8 @@ function App() {
     setCurrentTime(0);
     setDuration(0);
     setZoom(0);
-    setSelection(null);
-    selectionRef.current = null;
+    setPendingRegion(null);
+    pendingRegionRef.current = null;
     initWaveSurfer(file);
   }, [initWaveSurfer, showNotification]);
 
@@ -238,11 +304,11 @@ function App() {
     if (wavesurferRef.current) {
       const ws = wavesurferRef.current;
       
-      if (selectionRef.current) {
+      if (pendingRegionRef.current) {
         if (ws.isPlaying()) {
           ws.pause();
         } else {
-          ws.play(selectionRef.current.start);
+          ws.play(pendingRegionRef.current.start);
         }
       } else {
         ws.playPause();
@@ -367,6 +433,14 @@ function App() {
     return () => container.removeEventListener('wheel', handleWheel);
   }, [zoom]);
 
+  const getPinPosition = useCallback((time: number) => {
+    if (!waveformRef.current || !wavesurferRef.current) return 0;
+    const container = waveformRef.current;
+    const totalWidth = container.scrollWidth;
+    const duration = wavesurferRef.current.getDuration();
+    return (time / duration) * totalWidth;
+  }, []);
+
   if (!audioFile) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 flex items-center justify-center p-4">
@@ -436,8 +510,8 @@ function App() {
               setAudioFile(null);
               setIsReady(false);
               setRegions([]);
-              setSelection(null);
-              selectionRef.current = null;
+              setPendingRegion(null);
+              pendingRegionRef.current = null;
               setCurrentTime(0);
               setDuration(0);
               setZoom(0);
@@ -464,14 +538,63 @@ function App() {
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-slate-300">Waveform</h2>
             <span className="text-xs text-slate-500">
-              Drag to select • Scroll to zoom • Click to seek
+              Drag to select • Scroll to zoom • Click to seek • Drag pins to adjust
             </span>
           </div>
           
           <div
             ref={waveformRef}
-            className="rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50"
-          />
+            className="relative rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50"
+          >
+            {/* Pins and highlight overlay - inside waveform container so they scroll/zoom with it */}
+            {pendingRegion && isReady && (
+              <>
+                {/* Highlight overlay */}
+                <div
+                  className="absolute top-0 bottom-0 pointer-events-none bg-yellow-400/20 border-l-2 border-r-2 border-yellow-400/50"
+                  style={{
+                    left: `${getPinPosition(pendingRegion.start)}px`,
+                    width: `${getPinPosition(pendingRegion.end) - getPinPosition(pendingRegion.start)}px`,
+                    height: '100%',
+                  }}
+                />
+                
+                {/* Start pin */}
+                <div
+                  className="absolute top-0 w-6 h-8 cursor-ew-resize select-none z-10"
+                  style={{ left: `${getPinPosition(pendingRegion.start) - 12}px` }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handlePinDragStart('start');
+                  }}
+                >
+                  <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
+                  <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
+                  <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
+                    {formatTime(pendingRegion.start)}
+                  </div>
+                </div>
+                
+                {/* End pin */}
+                <div
+                  className="absolute top-0 w-6 h-8 cursor-ew-resize select-none z-10"
+                  style={{ left: `${getPinPosition(pendingRegion.end) - 12}px` }}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handlePinDragStart('end');
+                  }}
+                >
+                  <div className="w-0.5 h-full bg-yellow-400 mx-auto" />
+                  <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-yellow-400 rounded-full shadow-lg hover:bg-yellow-300 transition-colors" />
+                  <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-mono text-yellow-400 whitespace-nowrap">
+                    {formatTime(pendingRegion.end)}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
           
           {!isReady && (
             <div className="flex items-center justify-center py-8">
@@ -481,27 +604,27 @@ function App() {
           )}
         </div>
 
-        {selection && isReady && (
+        {pendingRegion && isReady && (
           <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4">
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-sm font-medium text-yellow-400 mb-1">Current Selection</h3>
                 <p className="text-xs text-slate-400">
-                  {formatTime(selection.start)} → {formatTime(selection.end)} 
+                  {formatTime(pendingRegion.start)} → {formatTime(pendingRegion.end)} 
                   <span className="ml-2 text-slate-500">
-                    ({formatTime(selection.end - selection.start)})
+                    ({formatTime(pendingRegion.end - pendingRegion.start)})
                   </span>
                 </p>
               </div>
               <div className="flex gap-2">
                 <button
-                  onClick={cancelSelection}
+                  onClick={cancelPendingRegion}
                   className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded-lg transition-colors"
                 >
                   Cancel
                 </button>
                 <button
-                  onClick={addSelection}
+                  onClick={addPendingRegion}
                   className="px-4 py-2 bg-yellow-500 hover:bg-yellow-400 text-slate-900 font-semibold text-sm rounded-lg transition-colors"
                 >
                   Add to List
@@ -582,7 +705,7 @@ function App() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
               </svg>
               <p className="text-sm">Drag on the waveform to select a region</p>
-              <p className="text-xs mt-1 text-slate-600">Then click "Add to List" to save it</p>
+              <p className="text-xs mt-1 text-slate-600">Drag pins to adjust, then click "Add to List"</p>
             </div>
           ) : (
             <div className="space-y-2">
@@ -694,11 +817,11 @@ function App() {
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">2.</span>
-              <span>Click "Add to List" to save the selection</span>
+              <span>Drag yellow pins to fine-tune boundaries</span>
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">3.</span>
-              <span>Scroll wheel zooms in/out for precision</span>
+              <span>Click "Add to List" to save the selection</span>
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">4.</span>
