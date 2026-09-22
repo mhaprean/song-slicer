@@ -250,3 +250,65 @@ export function downloadBlob(blob: Blob, filename: string): void {
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
+
+/** mm:ss.mmm — millisecond precision for editing readouts. */
+export function formatTimeMs(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) seconds = 0;
+  const totalMs = Math.round(seconds * 1000);
+  const ms = totalMs % 1000;
+  const totalSec = Math.floor(totalMs / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+}
+
+/**
+ * Apply linear fade-in / fade-out (in seconds) at the edges of a buffer, in place.
+ * Either value may be 0 to skip that edge. Used for export processing.
+ */
+export function applyFades(
+  audioBuffer: AudioBuffer,
+  fadeInSec: number,
+  fadeOutSec: number
+): void {
+  const sr = audioBuffer.sampleRate;
+  const len = audioBuffer.length;
+  const nIn = Math.max(0, Math.floor(fadeInSec * sr));
+  const nOut = Math.max(0, Math.floor(fadeOutSec * sr));
+  if ((nIn <= 0 && nOut <= 0) || len <= 0) return;
+
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < nIn && i < len; i++) {
+      data[i] *= i / nIn;
+    }
+    for (let i = 0; i < nOut && i < len; i++) {
+      data[len - 1 - i] *= i / nOut;
+    }
+  }
+}
+
+/**
+ * Peak-normalize all channels so the loudest sample hits `targetDbFS` (dBFS).
+ * No-op for silent buffers. Applied per-region before encoding/merging.
+ */
+export function normalizeBuffer(audioBuffer: AudioBuffer, targetDbFS = -1): void {
+  let peak = 0;
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i] < 0 ? -data[i] : data[i];
+      if (v > peak) peak = v;
+    }
+  }
+  if (peak <= 0) return;
+
+  const target = Math.pow(10, targetDbFS / 20);
+  const gain = target / peak;
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < data.length; i++) {
+      data[i] *= gain;
+    }
+  }
+}

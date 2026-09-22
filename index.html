@@ -1,90 +1,59 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Audio Cutter - Cut & Export Audio</title>
+    <meta
+      name="description"
+      content="Audio Cutter — slice loops from any song on a zoomable waveform and export WAV/MP3, entirely in your browser."
+    />
+    <title>Audio Cutter — Cut & Export Audio</title>
     <link
-      rel="stylesheet"
-      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236366f1'/%3E%3Cpath d='M12 22V10l10-2v11' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='10' cy='22' r='2.5' fill='white'/%3E%3Ccircle cx='20' cy='20' r='2.5' fill='white'/%3E%3C/svg%3E"
     />
     <style>
-      /* 内联样式确保主题色立即生效，避免闪烁 */
+      /* Flash prevention: paint the app background before CSS loads */
       html,
       body {
         margin: 0;
         padding: 0;
         width: 100%;
-        height: 100%;
-      }
-      html.light,
-      html.light body {
-        background-color: #ffffff !important;
-        color: #000000;
-      }
-      html.dark,
-      html.dark body {
-        background-color: #1a1a1a !important;
-        color: #ffffff;
+        min-height: 100%;
+        background-color: #05070f;
+        color-scheme: dark;
       }
     </style>
     <script>
-      // 在 React 加载前立即设置主题，避免闪烁
-      (function () {
-        const isInIframe = window.self !== window.top;
-
-        function applyThemeToDOM(theme) {
-          document.documentElement.classList.remove("light", "dark");
-          document.documentElement.classList.add(theme);
-          document.documentElement.setAttribute("data-theme", theme);
-        }
-
-        if (isInIframe) {
-          // 监听父窗口主动推送的主题消息
-          window.addEventListener("message", function (event) {
-            if (event.data && typeof event.data.theme === "string") {
-              const theme = event.data.theme;
-              if (theme === "light" || theme === "dark") {
-                applyThemeToDOM(theme);
-              }
-            }
-          });
-        } else {
-          // 非 iframe 环境，使用默认 light 主题
-          applyThemeToDOM("light");
-        }
-      })();
-    </script>
-      <script>
+      // Report runtime errors to the sandbox host when embedded in an iframe.
       (function () {
         if (window.self === window.top) return;
         var reported = {};
-        window.addEventListener("error", function (event) {
-          // 资源加载失败的 error 事件没有 message，此处仅上报 JS 运行时错误
+        window.addEventListener('error', function (event) {
+          // Resource load errors have no message; only report JS runtime errors
           if (!event || !event.message) return;
-          var key =
-            event.message + "|" + (event.filename || "") + "|" + (event.lineno || 0);
-          if (reported[key]) return; // 相同错误只上报一次，避免渲染循环刷屏
+          var key = event.message + '|' + (event.filename || '') + '|' + event.lineno;
+          if (reported[key]) return; // same error only once, avoid render-loop spam
           reported[key] = true;
           try {
             window.parent.postMessage(
               {
-                type: "sandbox-runtime-error",
+                type: 'sandbox-runtime-error',
                 payload: {
                   message: String(event.message).slice(0, 500),
-                  filename: event.filename || "",
+                  filename: event.filename || '',
                   lineno: event.lineno || 0,
                   colno: event.colno || 0,
                   stack:
                     event.error && event.error.stack
                       ? String(event.error.stack).slice(0, 2000)
-                      : ""
+                      : ''
                 }
               },
-              "*"
+              '*'
             );
           } catch (e) {
-            /* 上报失败不影响页面运行 */
+            /* reporting failures must never break the app */
           }
         });
       })();
@@ -92,6 +61,6 @@
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
