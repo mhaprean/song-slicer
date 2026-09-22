@@ -1,6 +1,54 @@
 // Audio export utilities for WAV and MP3 encoding
 
-export function encodeWAV(audioBuffer: AudioBuffer): Blob {
+/** Find the nearest sample index where all channels cross ~zero (within `tolerance`). */
+export function findZeroCrossing(
+  audioBuffer: AudioBuffer,
+  time: number,
+  searchSeconds = 0.05,
+  tolerance = 0.01
+): number {
+  const sr = audioBuffer.sampleRate;
+  const center = Math.floor(time * sr);
+  const radius = Math.max(1, Math.floor(searchSeconds * sr));
+  const from = Math.max(0, center - radius);
+  const to = Math.min(audioBuffer.length - 1, center + radius);
+
+  let best = center;
+  let bestDist = Infinity;
+  for (let i = from; i <= to; i++) {
+    let maxAbs = 0;
+    for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+      const v = Math.abs(audioBuffer.getChannelData(ch)[i]);
+      if (v > maxAbs) maxAbs = v;
+    }
+    if (maxAbs < tolerance) {
+      const dist = Math.abs(i - center);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+  }
+  return best / sr;
+}
+
+/** Apply a short linear fade at both edges of an AudioBuffer in place (de-click). */
+export function applyEdgeFades(audioBuffer: AudioBuffer, seconds = 0.003): void {
+  const n = Math.min(audioBuffer.length, Math.max(1, Math.floor(seconds * audioBuffer.sampleRate)));
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < n; i++) {
+      const g = i / n;
+      data[i] *= g;
+      data[audioBuffer.length - 1 - i] *= g;
+    }
+  }
+}
+
+export async function encodeWAV(
+  audioBuffer: AudioBuffer,
+  onProgress?: (fraction: number) => void
+): Promise<Blob> {
   const numChannels = audioBuffer.numberOfChannels;
   const sampleRate = audioBuffer.sampleRate;
   const format = 1; // PCM
@@ -36,14 +84,21 @@ export function encodeWAV(audioBuffer: AudioBuffer): Blob {
   }
 
   let offset = 44;
-  for (let i = 0; i < audioBuffer.length; i++) {
+  const total = audioBuffer.length;
+  const YIELD_EVERY = 1 << 19; // ~0.5M frames between yields (~10s of audio)
+  for (let i = 0; i < total; i++) {
     for (let ch = 0; ch < numChannels; ch++) {
       const sample = Math.max(-1, Math.min(1, channels[ch][i]));
       const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
       view.setInt16(offset, intSample, true);
       offset += 2;
     }
+    if (i % YIELD_EVERY === 0 && i > 0) {
+      onProgress?.(i / total);
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
+  onProgress?.(1);
 
   return new Blob([arrayBuffer], { type: 'audio/wav' });
 }
@@ -54,7 +109,10 @@ function writeString(view: DataView, offset: number, str: string) {
   }
 }
 
-export async function encodeMP3(audioBuffer: AudioBuffer): Promise<Blob> {
+export async function encodeMP3(
+  audioBuffer: AudioBuffer,
+  onProgress?: (fraction: number) => void
+): Promise<Blob> {
   const lamejs = await import('lamejs');
 
   const numChannels = audioBuffer.numberOfChannels;
@@ -91,7 +149,8 @@ export async function encodeMP3(audioBuffer: AudioBuffer): Promise<Blob> {
 
   const mp3Data: Uint8Array[] = [];
 
-  for (let i = 0; i < left.length; i += blockSize) {
+  const totalBlocks = Math.ceil(left.length / blockSize);
+  for (let i = 0, block = 0; i < left.length; i += blockSize, block++) {
     const leftChunk = left.subarray(i, i + blockSize);
     let mp3buf: Uint8Array;
 
@@ -105,12 +164,19 @@ export async function encodeMP3(audioBuffer: AudioBuffer): Promise<Blob> {
     if (mp3buf.length > 0) {
       mp3Data.push(mp3buf);
     }
+
+    // Yield to the UI every ~0.5s of audio so the browser can breathe
+    if (onProgress && block % 20 === 0) {
+      onProgress(block / totalBlocks);
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
 
   const end = mp3encoder.flush();
   if (end.length > 0) {
     mp3Data.push(end);
   }
+  onProgress?.(1);
 
   const totalLength = mp3Data.reduce((acc, arr) => acc + arr.length, 0);
   const result = new Uint8Array(totalLength);
@@ -159,4 +225,28 @@ export function formatTime(seconds: number): string {
   const secs = Math.floor(seconds % 60);
   const ms = Math.floor((seconds % 1) * 100);
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+}
+
+/** Lowercase, filesystem-safe slug from a user-provided name. */
+export function slugifyName(name: string | undefined | null): string {
+  return (name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** "01_my-loop" style slug for export filenames. */
+export function loopFileName(index: number, name: string | undefined, base: string, format: string): string {
+  const slug = slugifyName(name);
+  const parts = [String(index).padStart(2, '0'), slug || base];
+  return parts.join('_');
+}
+
+/** Trigger a browser download for a Blob. */
+export function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }

@@ -1,19 +1,33 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import WaveSurfer from 'wavesurfer.js';
-import { encodeWAV, encodeMP3, extractRegion, formatTime } from './utils/audioExport';
+import {
+  encodeWAV,
+  encodeMP3,
+  extractRegion,
+  formatTime,
+  findZeroCrossing,
+  applyEdgeFades,
+  loopFileName,
+  slugifyName,
+  downloadBlob,
+} from './utils/audioExport';
+import { createZipAsync } from './utils/zip';
 
 interface RegionInfo {
   id: string;
   start: number;
   end: number;
   color: string;
+  name?: string;
 }
 
 interface LoopRange {
   start: number;
   end: number;
 }
+
+type ExportMode = 'merged' | 'separate';
 
 const REGION_COLORS = [
   'rgba(99, 102, 241, 0.4)',
@@ -26,8 +40,31 @@ const REGION_COLORS = [
 
 const MIN_LOOP = 0.01; // minimum loop length in seconds
 const MAX_ZOOM = 2000; // max pixels per second
+const NUDGE = 0.01; // nudge step (10 ms)
+const FADE = 0.003; // de-click fade length in seconds
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+
+const PREFS_KEY = 'song-slicer:prefs:v1';
+const regionsKey = (fileName: string, size: number) => `song-slicer:regions:v1:${fileName}:${size}`;
+
+interface Prefs {
+  exportFormat: 'wav' | 'mp3';
+  exportMode: ExportMode;
+  gapMs: number;
+  snap: boolean;
+  volume: number;
+}
+
+function loadPrefs(): Partial<Prefs> {
+  try {
+    return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+const savedPrefs = loadPrefs();
 
 /** Numeric text field that commits valid values live and reverts on blur. */
 function TimeField({ value, onCommit }: { value: number; onCommit: (v: number) => void }) {
@@ -175,11 +212,19 @@ function App() {
   const [regions, setRegions] = useState<RegionInfo[]>([]);
   const [isFileDragging, setIsFileDragging] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [exportFormat, setExportFormat] = useState<'wav' | 'mp3'>('wav');
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportStage, setExportStage] = useState('');
+  const [exportFormat, setExportFormat] = useState<'wav' | 'mp3'>(savedPrefs.exportFormat ?? 'wav');
+  const [exportMode, setExportMode] = useState<ExportMode>(savedPrefs.exportMode ?? 'merged');
+  const [gapMs, setGapMs] = useState(savedPrefs.gapMs ?? 500);
+  const [snap, setSnap] = useState(savedPrefs.snap ?? true);
+  const [volume, setVolume] = useState(savedPrefs.volume ?? 1);
   const [notification, setNotification] = useState<string | null>(null);
   const [loop, setLoop] = useState<LoopRange>({ start: 0, end: 0 });
   const [loopEnabled, setLoopEnabled] = useState(true);
   const [waveWrapper, setWaveWrapper] = useState<HTMLElement | null>(null);
+  const [undoState, setUndoState] = useState<RegionInfo[] | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
 
   const waveformRef = useRef<HTMLDivElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
@@ -192,11 +237,62 @@ function App() {
   const durationRef = useRef(0);
   const zoomRef = useRef(0);
   const previewRef = useRef<LoopRange | null>(null);
+  const snapRef = useRef(snap);
+  const volumeRef = useRef(volume);
+  const regionsRef = useRef<RegionInfo[]>([]);
 
   const showNotification = useCallback((msg: string) => {
     setNotification(msg);
     setTimeout(() => setNotification(null), 3000);
   }, []);
+
+  // ---- Persistence --------------------------------------------------------
+
+  useEffect(() => {
+    const prefs: Prefs = { exportFormat, exportMode, gapMs, snap, volume };
+    try {
+      localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+    } catch {
+      /* storage may be unavailable */
+    }
+  }, [exportFormat, exportMode, gapMs, snap, volume]);
+
+  const persistRegions = useCallback(
+    (list: RegionInfo[]) => {
+      try {
+        if (audioFile) localStorage.setItem(regionsKey(audioFile.name, audioFile.size), JSON.stringify(list));
+      } catch {
+        /* storage may be unavailable */
+      }
+    },
+    [audioFile]
+  );
+
+  const setRegionsAndPersist = useCallback(
+    (updater: (prev: RegionInfo[]) => RegionInfo[]) => {
+      setRegions((prev) => {
+        const next = updater(prev);
+        try {
+          if (audioFile) localStorage.setItem(regionsKey(audioFile.name, audioFile.size), JSON.stringify(next));
+        } catch {
+          /* storage may be unavailable */
+        }
+        return next;
+      });
+    },
+    [audioFile]
+  );
+
+  const handleUnload = useCallback((e: BeforeUnloadEvent) => {
+    e.preventDefault();
+    e.returnValue = '';
+  }, []);
+
+  useEffect(() => {
+    if (regions.length === 0) return;
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
+  }, [regions.length, handleUnload]);
 
   /** Single source of truth for loop changes: clamps and keeps the ref in sync. */
   const applyLoop = useCallback((next: LoopRange) => {
@@ -212,130 +308,137 @@ function App() {
     setLoop(v);
   }, []);
 
-  const initWaveSurfer = useCallback(async (file: File) => {
-    if (wavesurferRef.current) {
-      wavesurferRef.current.destroy();
-      wavesurferRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-    }
-
-    setIsReady(false);
-    setIsPlaying(false);
-    setCurrentTime(0);
-    setDuration(0);
-    setZoom(0);
-    zoomRef.current = 0;
-    setWaveWrapper(null);
-
-    const audioContext = new AudioContext();
-    audioContextRef.current = audioContext;
-
-    let rawBuffer: ArrayBuffer;
-    try {
-      rawBuffer = await file.arrayBuffer();
-    } catch (err) {
-      console.error('Failed to read file:', err);
-      showNotification('Failed to read audio file');
-      return;
-    }
-
-    const bufferCopy = rawBuffer.slice(0);
-
-    let audioBuffer: AudioBuffer;
-    try {
-      audioBuffer = await audioContext.decodeAudioData(rawBuffer);
-    } catch (err) {
-      console.error('Failed to decode audio:', err);
-      showNotification('Failed to decode audio file');
-      return;
-    }
-    audioBufferRef.current = audioBuffer;
-
-    let mimeType = file.type;
-    if (!mimeType || mimeType === '') {
-      const ext = file.name.split('.').pop()?.toLowerCase();
-      const mimeMap: Record<string, string> = {
-        'mp3': 'audio/mpeg',
-        'wav': 'audio/wav',
-        'ogg': 'audio/ogg',
-        'flac': 'audio/flac',
-        'm4a': 'audio/mp4',
-        'aac': 'audio/aac',
-        'webm': 'audio/webm',
-      };
-      mimeType = mimeMap[ext || ''] || 'audio/mpeg';
-    }
-
-    const blob = new Blob([bufferCopy], { type: mimeType });
-
-    const ws = WaveSurfer.create({
-      container: waveformRef.current!,
-      waveColor: '#6366f1',
-      progressColor: '#4f46e5',
-      cursorColor: '#ef4444',
-      cursorWidth: 2,
-      height: 180,
-      barWidth: 2,
-      barGap: 1,
-      barRadius: 2,
-      normalize: true,
-      interact: true,
-    });
-
-    const loadTimeout = setTimeout(() => {
-      if (!wavesurferRef.current) return;
-      const dur = wavesurferRef.current.getDuration();
-      if (dur === 0) {
-        showNotification('Audio loading timed out');
+  const initWaveSurfer = useCallback(
+    async (file: File) => {
+      if (wavesurferRef.current) {
+        wavesurferRef.current.destroy();
+        wavesurferRef.current = null;
       }
-    }, 15000);
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
 
-    ws.on('ready', () => {
-      clearTimeout(loadTimeout);
-      const dur = ws.getDuration();
-      durationRef.current = dur;
-      setDuration(dur);
-      // Markers start at the beginning and the end of the track
-      applyLoop({ start: 0, end: dur });
-      loopEnabledRef.current = true;
-      setLoopEnabled(true);
-      setWaveWrapper(ws.getWrapper());
-      setIsReady(true);
-    });
-
-    ws.on('error', (err: unknown) => {
-      clearTimeout(loadTimeout);
-      console.error('WaveSurfer error:', err);
-      showNotification('Error loading audio');
-    });
-
-    ws.on('play', () => setIsPlaying(true));
-    ws.on('pause', () => {
+      setIsReady(false);
       setIsPlaying(false);
-      previewRef.current = null;
-    });
+      setCurrentTime(0);
+      setDuration(0);
+      setZoom(0);
+      zoomRef.current = 0;
+      setWaveWrapper(null);
+      setUndoState(null);
 
-    ws.on('timeupdate', (time: number) => {
-      setCurrentTime(time);
-      // Wrap at the end of the active range: a previewed saved loop while it's
-      // playing, otherwise the loop selection when looping is enabled.
-      const active = previewRef.current ?? (loopEnabledRef.current ? loopRef.current : null);
-      if (active && ws.isPlaying() && active.end > active.start && time >= active.end - 0.005) {
-        ws.setTime(active.start);
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+
+      let rawBuffer: ArrayBuffer;
+      try {
+        rawBuffer = await file.arrayBuffer();
+      } catch (err) {
+        console.error('Failed to read file:', err);
+        showNotification('Failed to read audio file');
+        return;
       }
-    });
 
-    wavesurferRef.current = ws;
+      const bufferCopy = rawBuffer.slice(0);
 
-    try {
-      await ws.loadBlob(blob);
-    } catch (err) {
-      console.error('WaveSurfer loadBlob error:', err);
-      showNotification('Failed to load audio');
-    }
-  }, [applyLoop, showNotification]);
+      let audioBuffer: AudioBuffer;
+      try {
+        audioBuffer = await audioContext.decodeAudioData(rawBuffer);
+      } catch (err) {
+        console.error('Failed to decode audio:', err);
+        showNotification('Failed to decode audio file');
+        return;
+      }
+      audioBufferRef.current = audioBuffer;
+
+      let mimeType = file.type;
+      if (!mimeType || mimeType === '') {
+        const ext = file.name.split('.').pop()?.toLowerCase();
+        const mimeMap: Record<string, string> = {
+          mp3: 'audio/mpeg',
+          wav: 'audio/wav',
+          ogg: 'audio/ogg',
+          flac: 'audio/flac',
+          m4a: 'audio/mp4',
+          aac: 'audio/aac',
+          webm: 'audio/webm',
+        };
+        mimeType = mimeMap[ext || ''] || 'audio/mpeg';
+      }
+
+      const blob = new Blob([bufferCopy], { type: mimeType });
+
+      void volumeRef.current; // applied right after creation below
+
+      const ws = WaveSurfer.create({
+        container: waveformRef.current!,
+        waveColor: '#6366f1',
+        progressColor: '#4f46e5',
+        cursorColor: '#ef4444',
+        cursorWidth: 2,
+        height: 180,
+        barWidth: 2,
+        barGap: 1,
+        barRadius: 2,
+        normalize: true,
+        interact: true,
+      });
+      ws.setVolume(volumeRef.current);
+
+      const loadTimeout = setTimeout(() => {
+        if (!wavesurferRef.current) return;
+        const dur = wavesurferRef.current.getDuration();
+        if (dur === 0) {
+          showNotification('Audio loading timed out');
+        }
+      }, 15000);
+
+      ws.on('ready', () => {
+        clearTimeout(loadTimeout);
+        const dur = ws.getDuration();
+        durationRef.current = dur;
+        setDuration(dur);
+        // Markers start at the beginning and the end of the track
+        applyLoop({ start: 0, end: dur });
+        loopEnabledRef.current = true;
+        setLoopEnabled(true);
+        setWaveWrapper(ws.getWrapper());
+        setIsReady(true);
+      });
+
+      ws.on('error', (err: unknown) => {
+        clearTimeout(loadTimeout);
+        console.error('WaveSurfer error:', err);
+        showNotification('Error loading audio');
+      });
+
+      ws.on('play', () => setIsPlaying(true));
+      ws.on('pause', () => {
+        setIsPlaying(false);
+        previewRef.current = null;
+      });
+
+      ws.on('timeupdate', (time: number) => {
+        setCurrentTime(time);
+        // Wrap at the end of the active range: a previewed saved loop while it's
+        // playing, otherwise the loop selection when looping is enabled.
+        const active = previewRef.current ?? (loopEnabledRef.current ? loopRef.current : null);
+        if (active && ws.isPlaying() && active.end > active.start && time >= active.end - 0.005) {
+          ws.setTime(active.start);
+        }
+      });
+
+      wavesurferRef.current = ws;
+
+      try {
+        await ws.loadBlob(blob);
+      } catch (err) {
+        console.error('WaveSurfer loadBlob error:', err);
+        showNotification('Failed to load audio');
+      }
+    },
+    [applyLoop, showNotification]
+  );
 
   const handleFileSelect = useCallback(
     (file: File) => {
@@ -351,6 +454,19 @@ function App() {
       setZoom(0);
       zoomRef.current = 0;
       initWaveSurfer(file);
+      // Restore previously saved loops for this exact file
+      try {
+        const raw = localStorage.getItem(regionsKey(file.name, file.size));
+        const list: RegionInfo[] = raw ? JSON.parse(raw) : [];
+        if (Array.isArray(list) && list.length > 0) {
+          setRegions(list);
+          const maxIdx = list.length;
+          colorCounterRef.current = maxIdx;
+          showNotification(`Restored ${list.length} saved loop${list.length !== 1 ? 's' : ''}`);
+        }
+      } catch {
+        /* ignore malformed storage */
+      }
     },
     [initWaveSurfer, showNotification]
   );
@@ -419,6 +535,17 @@ function App() {
         el.removeEventListener('pointermove', onMove);
         el.removeEventListener('pointerup', onUp);
         el.removeEventListener('pointercancel', onUp);
+        // Snap to the nearest zero-crossing on release for click-free loops
+        if (snapRef.current) {
+          const ws = wavesurferRef.current;
+          const buf = audioBufferRef.current;
+          if (ws && buf) {
+            const { start, end } = loopRef.current;
+            const s2 = findZeroCrossing(buf, start);
+            const e2 = findZeroCrossing(buf, end);
+            if (e2 - s2 >= MIN_LOOP) applyLoop({ start: s2, end: e2 });
+          }
+        }
       };
       el.addEventListener('pointermove', onMove);
       el.addEventListener('pointerup', onUp);
@@ -478,6 +605,7 @@ function App() {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      const ws = wavesurferRef.current;
       if (e.code === 'Space') {
         e.preventDefault();
         togglePlay();
@@ -485,11 +613,27 @@ function App() {
         setStartAtPlayhead();
       } else if (e.key === ']') {
         setEndAtPlayhead();
+      } else if (ws && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        e.preventDefault();
+        const dur = durationRef.current;
+        const left = e.key === 'ArrowLeft';
+        const { start, end } = loopRef.current;
+        if (e.shiftKey) {
+          // Shift extends: start moves left / end moves right
+          if (left) applyLoop({ start: clamp(start - NUDGE, 0, end - MIN_LOOP), end });
+          else applyLoop({ start, end: clamp(end + NUDGE, start + MIN_LOOP, dur) });
+        } else if (e.altKey) {
+          // Alt shrinks: end moves left / start moves right
+          if (left) applyLoop({ start, end: clamp(end - NUDGE, start + MIN_LOOP, dur) });
+          else applyLoop({ start: clamp(start + NUDGE, 0, end - MIN_LOOP), end });
+        } else {
+          ws.setTime(clamp(ws.getCurrentTime() + (left ? -NUDGE : NUDGE), 0, dur));
+        }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [togglePlay, setStartAtPlayhead, setEndAtPlayhead]);
+  }, [togglePlay, setStartAtPlayhead, setEndAtPlayhead, applyLoop]);
 
   // ---- Zoom (cursor-anchored) ----------------------------------------------
 
@@ -557,7 +701,7 @@ function App() {
     return () => container.removeEventListener('wheel', handleWheel);
   }, [zoomTo, audioFile, isReady]);
 
-  // ---- Saved regions & export ----------------------------------------------
+  // ---- Saved regions --------------------------------------------------------
 
   const addLoopToList = useCallback(() => {
     const { start, end } = loopRef.current;
@@ -570,88 +714,194 @@ function App() {
       end,
       color: REGION_COLORS[colorIdx],
     };
-    setRegions((prev) => [...prev, newRegion]);
+    setRegionsAndPersist((prev) => [...prev, newRegion]);
     showNotification('Loop added to list');
-  }, [showNotification]);
+  }, [showNotification, setRegionsAndPersist]);
 
   const playRegion = useCallback((regionId: string) => {
-    const region = regions.find((r) => r.id === regionId);
     const ws = wavesurferRef.current;
-    if (!region || !ws) return;
+    if (!ws) return;
+    const region = regionsRef.current.find((r) => r.id === regionId);
+    if (!region) return;
     // Preview this saved loop with its own wrap-around
     previewRef.current = { start: region.start, end: region.end };
     if (!ws.isPlaying()) ws.setTime(region.start);
     ws.play();
-  }, [regions]);
-
-  const removeRegion = useCallback((regionId: string) => {
-    setRegions((prev) => prev.filter((r) => r.id !== regionId));
   }, []);
+
+  const recallRegion = useCallback(
+    (regionId: string) => {
+      const region = regions.find((r) => r.id === regionId);
+      const ws = wavesurferRef.current;
+      if (!region || !ws) return;
+      ws.pause();
+      previewRef.current = null;
+      applyLoop({ start: region.start, end: region.end });
+      if (!loopEnabledRef.current) toggleLoopEnabled();
+      // Bring the loop start into view when zoomed in
+      const scroll = ws.getWrapper().parentElement as HTMLElement | null;
+      if (scroll && zoomRef.current > 0) {
+        scroll.scrollLeft = clamp(
+          region.start * zoomRef.current - scroll.clientWidth / 3,
+          0,
+          Math.max(0, scroll.scrollWidth - scroll.clientWidth)
+        );
+      }
+    },
+    [regions, applyLoop, toggleLoopEnabled]
+  );
+
+  const renameRegion = useCallback(
+    (regionId: string, name: string) => {
+      setRegionsAndPersist((prev) => prev.map((r) => (r.id === regionId ? { ...r, name } : r)));
+    },
+    [setRegionsAndPersist]
+  );
+
+  const removeRegion = useCallback(
+    (regionId: string) => {
+      setRegionsAndPersist((prev) => prev.filter((r) => r.id !== regionId));
+    },
+    [setRegionsAndPersist]
+  );
+
+  const moveRegion = useCallback(
+    (regionId: string, dir: -1 | 1) => {
+      setRegionsAndPersist((prev) => {
+        const idx = prev.findIndex((r) => r.id === regionId);
+        const target = idx + dir;
+        if (idx < 0 || target < 0 || target >= prev.length) return prev;
+        const next = [...prev];
+        const [item] = next.splice(idx, 1);
+        next.splice(target, 0, item);
+        return next;
+      });
+    },
+    [setRegionsAndPersist]
+  );
 
   const clearAllRegions = useCallback(() => {
-    setRegions([]);
-  }, []);
+    if (regions.length === 0) return;
+    setUndoState(regions);
+    setRegionsAndPersist(() => []);
+    showNotification('Cleared — click Undo to restore');
+  }, [regions, setRegionsAndPersist, showNotification]);
+
+  const undoClear = useCallback(() => {
+    if (!undoState) return;
+    setRegionsAndPersist(() => undoState);
+    colorCounterRef.current = Math.max(colorCounterRef.current, undoState.length);
+    setUndoState(null);
+  }, [undoState, setRegionsAndPersist]);
+
+  // ---- Export -----------------------------------------------------------------
 
   const runExport = useCallback(
-    async (list: { start: number; end: number }[], suffix: string, format: 'wav' | 'mp3') => {
+    async (list: { start: number; end: number; name?: string }[], suffix: string, format: 'wav' | 'mp3') => {
       if (!audioBufferRef.current || !audioContextRef.current || list.length === 0) {
         showNotification('Nothing to export');
         return;
       }
 
       setIsExporting(true);
+      setExportProgress(0);
+      setExportStage('Preparing…');
 
       try {
         const ctx = audioContextRef.current;
         const audioBuffer = audioBufferRef.current;
-
-        const totalLength = list.reduce((acc, r) => {
-          return acc + Math.max(0, Math.floor((r.end - r.start) * audioBuffer.sampleRate));
-        }, 0);
-
-        const outputBuffer = ctx.createBuffer(audioBuffer.numberOfChannels, totalLength, audioBuffer.sampleRate);
-
-        let offset = 0;
-        for (const r of list) {
+        const base = audioFile?.name?.replace(/\.[^.]+$/, '') || 'audio';          const encodeOne = async (r: { start: number; end: number; name?: string }, index: number, total: number): Promise<Blob> => {
           const regionBuffer = await extractRegion(ctx, audioBuffer, r.start, r.end);
-          for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-            const sourceData = regionBuffer.getChannelData(ch);
-            const targetData = outputBuffer.getChannelData(ch);
-            for (let i = 0; i < sourceData.length; i++) {
-              targetData[offset + i] = sourceData[i];
-            }
+          if (snapRef.current) applyEdgeFades(regionBuffer, FADE);
+
+          let blob: Blob;
+          if (format === 'wav') {
+            blob = await encodeWAV(regionBuffer, (f) => {
+              setExportProgress((index + f) / total);
+            });
+          } else {
+            blob = await encodeMP3(regionBuffer, (f) => {
+              setExportProgress((index + f) / total);
+            });
           }
-          offset += regionBuffer.length;
-        }
+          return blob;
+        };
 
-        let blob: Blob;
-        if (format === 'wav') {
-          blob = encodeWAV(outputBuffer);
+        if (exportMode === 'separate' && list.length > 1) {
+          // One file per loop, indexed and zipped
+          setExportStage('Encoding separate files…');
+          const files: { name: string; blob: Blob }[] = [];
+          const used = new Set<string>();
+          for (let i = 0; i < list.length; i++) {
+            setExportStage(`Encoding ${i + 1}/${list.length}…`);
+            const blob = await encodeOne(list[i], i, list.length);
+            let filename = `${loopFileName(i + 1, list[i].name, base, format)}.${format}`;
+            let n = 2;
+            while (used.has(filename)) filename = `${loopFileName(i + 1, list[i].name, base, format)}_${n++}.${format}`;
+            used.add(filename);
+            files.push({ name: filename, blob });
+          }
+          setExportStage('Packing ZIP…');
+          const zip = await createZipAsync(files);
+          downloadBlob(zip, `${base}_loops.zip`);
+          showNotification(`Exported ${files.length} files as ZIP!`);
         } else {
-          blob = await encodeMP3(outputBuffer);
+          // Single merged file, with optional silence between loops
+          setExportStage(list.length > 1 ? 'Merging loops…' : 'Encoding…');
+          const gapSamples = list.length > 1 ? Math.round((gapMs / 1000) * audioBuffer.sampleRate) : 0;
+          // Must match extractRegion's sample math exactly: floor(end*sr) - floor(start*sr),
+          // NOT floor((end-start)*sr) — the two can differ by 1 sample and overflow the copy.
+          const totalLength =
+            gapSamples * (list.length - 1) +
+            list.reduce((acc, r) => {
+              return (
+                acc +
+                Math.max(0, Math.floor(r.end * audioBuffer.sampleRate) - Math.floor(r.start * audioBuffer.sampleRate))
+              );
+            }, 0);
+
+          const outputBuffer = ctx.createBuffer(audioBuffer.numberOfChannels, totalLength, audioBuffer.sampleRate);
+
+          let offset = 0;
+          for (let i = 0; i < list.length; i++) {
+            const r = list[i];
+            const regionBuffer = await extractRegion(ctx, audioBuffer, r.start, r.end);
+            if (snapRef.current) applyEdgeFades(regionBuffer, FADE);
+            for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+              const dst = outputBuffer.getChannelData(ch);
+              const src = regionBuffer.getChannelData(ch);
+              const len = Math.min(src.length, dst.length - offset);
+              if (len > 0) dst.set(src.subarray(0, len), offset);
+            }
+            offset += regionBuffer.length + gapSamples;
+          }
+
+          let blob: Blob;
+          if (format === 'wav') {
+            blob = await encodeWAV(outputBuffer, (f) => setExportProgress(f));
+          } else {
+            blob = await encodeMP3(outputBuffer, (f) => setExportProgress(f));
+          }
+
+          // Name single exports after the loop when there's exactly one named loop
+          let exportName = `${base}_${suffix}`;
+          if (list.length === 1) {
+            const slug = slugifyName(list[0].name);
+            if (slug) exportName = slug;
+          }
+          downloadBlob(blob, `${exportName}.${format}`);
+          showNotification(`Exported as ${format.toUpperCase()} successfully!`);
         }
-
-        const base = audioFile?.name?.replace(/\.[^.]+$/, '') || 'audio';
-        const filename = `${base}_${suffix}.${format}`;
-
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-
-        showNotification(`Exported as ${format.toUpperCase()} successfully!`);
       } catch (err) {
         console.error('Export error:', err);
         showNotification('Export failed');
       } finally {
         setIsExporting(false);
+        setExportProgress(0);
+        setExportStage('');
       }
     },
-    [audioFile, showNotification]
+    [audioFile, exportMode, gapMs, showNotification]
   );
 
   const handleExportAll = useCallback(() => {
@@ -660,14 +910,18 @@ function App() {
       return;
     }
     return runExport(
-      regions.map((r) => ({ start: r.start, end: r.end })),
+      regions.map((r) => ({ start: r.start, end: r.end, name: r.name })),
       'cut',
       exportFormat
     );
   }, [regions, exportFormat, runExport, showNotification]);
 
   const handleExportLoop = useCallback(() => {
-    return runExport([{ start: loop.start, end: loop.end }], 'loop', exportFormat);
+    // If the current loop matches a saved one, export under that loop's name
+    const saved = regionsRef.current.find(
+      (r) => Math.abs(r.start - loop.start) < 0.005 && Math.abs(r.end - loop.end) < 0.005
+    );
+    return runExport([{ start: loop.start, end: loop.end, name: saved?.name }], 'loop', exportFormat);
   }, [loop, exportFormat, runExport]);
 
   // ---- Cleanup ---------------------------------------------------------------
@@ -682,6 +936,25 @@ function App() {
       }
     };
   }, []);
+
+  // Volume changes apply live
+  useEffect(() => {
+    wavesurferRef.current?.setVolume(volume);
+  }, [volume]);
+
+  // Keep refs in sync for native-event callbacks
+  useEffect(() => {
+    snapRef.current = snap;
+  }, [snap]);
+
+  useEffect(() => {
+    volumeRef.current = volume;
+    wavesurferRef.current?.setVolume(volume);
+  }, [volume]);
+
+  useEffect(() => {
+    regionsRef.current = regions;
+  }, [regions]);
 
   // ---- Render ------------------------------------------------------------------
 
@@ -700,7 +973,12 @@ function App() {
         >
           <div className="mb-6">
             <svg className="w-20 h-20 mx-auto text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={1.5}
+                d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"
+              />
             </svg>
           </div>
           <h1 className="text-3xl font-bold text-white mb-3">Audio Cutter</h1>
@@ -732,8 +1010,13 @@ function App() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 text-white">
       {notification && (
-        <div className="fixed top-4 right-4 z-50 bg-indigo-600 text-white px-6 py-3 rounded-xl shadow-lg animate-pulse">
+        <div className="fixed top-4 right-4 z-50 bg-indigo-600 text-white px-6 py-3 rounded-xl shadow-lg animate-pulse flex items-center gap-3">
           {notification}
+          {undoState && (
+            <button onClick={undoClear} className="underline text-yellow-200 hover:text-yellow-100 text-sm font-semibold">
+              Undo
+            </button>
+          )}
         </div>
       )}
 
@@ -741,7 +1024,12 @@ function App() {
         <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <svg className="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={1.5}
+                d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"
+              />
             </svg>
             <h1 className="text-xl font-bold">Audio Cutter</h1>
           </div>
@@ -759,6 +1047,7 @@ function App() {
               setDuration(0);
               setZoom(0);
               zoomRef.current = 0;
+              setUndoState(null);
             }}
             className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm transition-colors"
           >
@@ -770,7 +1059,12 @@ function App() {
       <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
         <div className="flex items-center gap-4 bg-slate-800/50 rounded-xl px-5 py-3 border border-slate-700/50">
           <svg className="w-5 h-5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"
+            />
           </svg>
           <span className="font-medium truncate">{audioFile.name}</span>
           <span className="text-slate-400 text-sm ml-auto shrink-0">{(audioFile.size / (1024 * 1024)).toFixed(2)} MB</span>
@@ -780,13 +1074,14 @@ function App() {
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-slate-300">Waveform</h2>
             <span className="text-xs text-slate-500">
-              Click to place playhead • [ / ] set loop points • Drag pins to adjust • Scroll to zoom • Double-click to reset loop
+              Click to place playhead • [ / ] set loop points • ←/→ nudge •              Shift+←/→ extend edges • Alt+←/→ shrink • Scroll to zoom •
+              Double-click to reset loop
             </span>
           </div>
 
           <div
             ref={waveformRef}
-            className="relative rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50"
+            className="relative rounded-lg overflow-x-auto overflow-y-hidden bg-slate-900/50 waveform-container"
             onDoubleClick={() => {
               resetLoop();
             }}
@@ -794,6 +1089,23 @@ function App() {
             {showPins &&
               createPortal(
                 <>
+                  {/* Saved-loop overlays so coverage and overlaps are visible */}
+                  {regions.map((r) => (
+                    <div
+                      key={`overlay-${r.id}`}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        bottom: 0,
+                        left: `${(r.start / duration) * 100}%`,
+                        width: `${Math.max(0.1, ((r.end - r.start) / duration) * 100)}%`,
+                        background: r.color.replace('0.4', '0.18'),
+                        borderTop: `2px solid ${r.color.replace('0.4', '0.8')}`,
+                        pointerEvents: 'none',
+                        zIndex: 3,
+                      }}
+                    />
+                  ))}
                   {/* Loop highlight — positioned in % of the timeline so it stays
                       locked to the selected seconds at any zoom level */}
                   <div
@@ -867,6 +1179,14 @@ function App() {
                 </button>
               </div>
 
+              <label
+                className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none"
+                title="Snap loop edges to the nearest silent point (zero-crossing) so cuts don't click"
+              >
+                <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} className="accent-indigo-500" />
+                Snap
+              </label>
+
               <div className="flex items-center gap-2 ml-auto">
                 <button
                   onClick={handleExportLoop}
@@ -908,6 +1228,39 @@ function App() {
               <span className="text-indigo-300">{formatTime(currentTime)}</span>
               <span className="text-slate-500">/</span>
               <span className="text-slate-400">{formatTime(duration)}</span>
+            </div>
+
+            {/* Volume */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setVolume((v) => (v > 0 ? 0 : 1))}
+                title={volume > 0 ? 'Mute' : 'Unmute'}
+                className="text-slate-400 hover:text-white transition-colors"
+              >
+                {volume > 0 ? (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M11 5L6 9H2v6h4l5 4V5zm4.535 1.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728"
+                    />
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M11 5L6 9H2v6h4l5 4V5zm5.5 5.5l4 4m0-4l-4 4" />
+                  </svg>
+                )}
+              </button>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={volume}
+                onChange={(e) => setVolume(Number(e.target.value))}
+                className="w-24 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                title="Volume"
+              />
             </div>
 
             <button
@@ -961,17 +1314,29 @@ function App() {
         <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-medium text-slate-300">Saved Loops ({regions.length})</h2>
-            {regions.length > 0 && (
-              <button onClick={clearAllRegions} className="text-xs text-red-400 hover:text-red-300 transition-colors">
-                Clear All
-              </button>
-            )}
+            <div className="flex items-center gap-4">
+              {undoState && (
+                <button onClick={undoClear} className="text-xs text-yellow-400 hover:text-yellow-300 transition-colors">
+                  Undo Clear
+                </button>
+              )}
+              {regions.length > 0 && (
+                <button onClick={clearAllRegions} className="text-xs text-red-400 hover:text-red-300 transition-colors">
+                  Clear All
+                </button>
+              )}
+            </div>
           </div>
 
           {regions.length === 0 ? (
             <div className="text-center py-8 text-slate-500">
               <svg className="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                  d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                />
               </svg>
               <p className="text-sm">Drag the pins on the waveform to set a loop</p>
               <p className="text-xs mt-1 text-slate-600">Then click "Add to List" to save it for export</p>
@@ -985,11 +1350,47 @@ function App() {
                 >
                   <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: region.color.replace('0.4', '1') }} />
                   <span className="text-sm font-medium text-slate-300 w-8">#{idx + 1}</span>
+                  {renamingId === region.id ? (
+                    <input
+                      autoFocus
+                      type="text"
+                      defaultValue={region.name || ''}
+                      onBlur={(e) => {
+                        renameRegion(region.id, e.target.value);
+                        setRenamingId(null);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                        if (e.key === 'Escape') setRenamingId(null);
+                      }}
+                      placeholder="Loop name…"
+                      className="bg-slate-800 border border-indigo-500 rounded-md px-2 py-1 text-sm text-slate-200 focus:outline-none w-40"
+                    />
+                  ) : (
+                    <button
+                      onClick={() => setRenamingId(region.id)}
+                      title="Click to rename"
+                      className={`text-sm truncate max-w-[10rem] hover:text-white transition-colors ${
+                        region.name ? 'text-slate-200' : 'text-slate-500 italic'
+                      }`}
+                    >
+                      {region.name || 'Untitled'}
+                    </button>
+                  )}
                   <span className="font-mono text-xs text-slate-400">
                     {formatTime(region.start)} → {formatTime(region.end)}
                   </span>
                   <span className="text-xs text-slate-500 ml-2">({formatTime(region.end - region.start)})</span>
-                  <div className="ml-auto flex items-center gap-2">
+                  <div className="ml-auto flex items-center gap-1">
+                    <button
+                      onClick={() => recallRegion(region.id)}
+                      className="p-1.5 hover:bg-slate-700 rounded-md transition-colors"
+                      title="Load into editor"
+                    >
+                      <svg className="w-4 h-4 text-indigo-300" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M20 20v-5h-5M4 9a8 8 0 0114-3m2 14a8 8 0 01-14 3" />
+                      </svg>
+                    </button>
                     <button
                       onClick={() => playRegion(region.id)}
                       className="p-1.5 hover:bg-slate-700 rounded-md transition-colors"
@@ -1000,12 +1401,37 @@ function App() {
                       </svg>
                     </button>
                     <button
+                      onClick={() => moveRegion(region.id, -1)}
+                      disabled={idx === 0}
+                      className="p-1.5 hover:bg-slate-700 rounded-md transition-colors disabled:opacity-30"
+                      title="Move up"
+                    >
+                      <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 15l7-7 7 7" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={() => moveRegion(region.id, 1)}
+                      disabled={idx === regions.length - 1}
+                      className="p-1.5 hover:bg-slate-700 rounded-md transition-colors disabled:opacity-30"
+                      title="Move down"
+                    >
+                      <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </button>
+                    <button
                       onClick={() => removeRegion(region.id)}
                       className="p-1.5 hover:bg-slate-700 rounded-md transition-colors"
                       title="Remove loop"
                     >
                       <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                        />
                       </svg>
                     </button>
                   </div>
@@ -1040,6 +1466,45 @@ function App() {
               </div>
             </div>
 
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">Multiple loops:</span>
+              <div className="flex rounded-lg overflow-hidden border border-slate-600">
+                <button
+                  onClick={() => setExportMode('merged')}
+                  title="All loops concatenated into one file"
+                  className={`px-4 py-2 text-sm font-medium transition-colors ${
+                    exportMode === 'merged' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  One file
+                </button>
+                <button
+                  onClick={() => setExportMode('separate')}
+                  title="One file per loop, packaged as a ZIP"
+                  className={`px-4 py-2 text-sm font-medium transition-colors ${
+                    exportMode === 'separate' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  ZIP
+                </button>
+              </div>
+            </div>
+
+            {exportMode === 'merged' && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400">Gap:</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="50"
+                  value={gapMs}
+                  onChange={(e) => setGapMs(Math.max(0, Number(e.target.value) || 0))}
+                  className="w-20 bg-slate-900/70 border border-slate-600 rounded-md px-2 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
+                />
+                <span className="text-xs text-slate-400">ms</span>
+              </div>
+            )}
+
             <button
               onClick={handleExportAll}
               disabled={!isReady || regions.length === 0 || isExporting}
@@ -1048,7 +1513,7 @@ function App() {
               {isExporting ? (
                 <>
                   <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
-                  Exporting...
+                  {exportStage || 'Exporting…'} {exportProgress > 0 ? `${Math.round(exportProgress * 100)}%` : ''}
                 </>
               ) : (
                 <>
@@ -1056,6 +1521,7 @@ function App() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
                   Export {regions.length} Loop{regions.length !== 1 ? 's' : ''}
+                  {exportMode === 'separate' && regions.length > 1 ? ' (ZIP)' : ''}
                 </>
               )}
             </button>
@@ -1084,7 +1550,11 @@ function App() {
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">3.</span>
-              <span>Scroll to zoom in for precision — the pins stay locked to their exact seconds</span>
+              <span>
+                Fine-tune with <kbd className="text-slate-300">←</kbd>/<kbd className="text-slate-300">→</kbd> (playhead) and{' '}
+                <kbd className="text-slate-300">Shift</kbd>+
+                <kbd className="text-slate-300">←</kbd>/<kbd className="text-slate-300">→</kbd> (loop edges); "Snap" removes clicks
+              </span>
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">4.</span>
@@ -1094,7 +1564,7 @@ function App() {
             </div>
             <div className="flex items-start gap-2">
               <span className="text-indigo-400 font-bold">5.</span>
-              <span>"Add to List" saves loops for batch export as WAV or MP3</span>
+              <span>"Add to List" saves loops (persisted per file) for batch export as WAV or MP3</span>
             </div>
           </div>
         </div>
