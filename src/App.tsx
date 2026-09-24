@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect, useMemo, type DragEvent } fro
 import { createPortal } from 'react-dom';
 import WaveSurfer from 'wavesurfer.js';
 import TimelinePlugin from 'wavesurfer.js/dist/plugins/timeline.js';
-import { LayoutGrid, AlertTriangle, Upload } from 'lucide-react';
+import { LayoutGrid, AlertTriangle, Upload, Timer } from 'lucide-react';
 import {
   encodeWAV,
   encodeMP3,
@@ -17,6 +17,7 @@ import {
   downloadBlob,
 } from './utils/audioExport';
 import { createZipAsync } from './utils/zip';
+import { detectBpm, type BpmDetection } from './utils/bpmDetect';
 import {
   REGION_COLORS,
   MIN_LOOP,
@@ -108,6 +109,8 @@ function App() {
   const [grid, setGrid] = useState(savedPrefs.grid);
   const [bpm, setBpm] = useState(savedPrefs.bpm);
   const [gridSnap, setGridSnap] = useState(savedPrefs.gridSnap);
+  const [bpmDetection, setBpmDetection] = useState<BpmDetection | null>(null);
+  const [detectingBpm, setDetectingBpm] = useState(false);
   const [snap, setSnap] = useState(savedPrefs.snap);
   const [abSlots, setAbSlots] = useState<{ a: LoopRange | null; b: LoopRange | null }>({
     a: null,
@@ -157,6 +160,9 @@ function App() {
   const regionsRef = useRef<RegionInfo[]>([]);
   const gridRef = useRef(grid);
   const bpmRef = useRef(bpm);
+  const bpmTouchedRef = useRef(false); // user set a BPM for the current file
+  const bpmDetectionRef = useRef<BpmDetection | null>(null);
+  const detectingBpmRef = useRef(false);
   const gridSnapRef = useRef(gridSnap);
   const focusedPinRef = useRef<'start' | 'end' | null>(null);
   const undoStackRef = useRef<LoopRange[]>([]);
@@ -298,6 +304,44 @@ function App() {
     setHistoryVersion((v) => v + 1);
   }, [applyLoop]);
 
+  // ---- BPM detection ----------------------------------------------------------
+  const runBpmDetection = useCallback(
+    async (buffer: AudioBuffer, forceApply = false) => {
+      if (detectingBpmRef.current) return;
+      detectingBpmRef.current = true;
+      setDetectingBpm(true);
+      try {
+        // Yield a frame so the UI never stalls while analyzing.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (audioBufferRef.current !== buffer) return; // file swapped mid-analysis
+        const result = detectBpm(buffer);
+        if (result) {
+          bpmDetectionRef.current = result;
+          setBpmDetection(result);
+          // Manual clicks always apply; on load only apply if the user hasn't
+          // already set a BPM for this file (covers edits made mid-analysis).
+          if (forceApply || !bpmTouchedRef.current) {
+            setBpm(clamp(Math.round(result.bpm), 20, 300));
+            bpmTouchedRef.current = false;
+            notify(`Detected ~${Math.round(result.bpm)} BPM — beat grid updated`);
+          } else {
+            notify(`Detected ~${Math.round(result.bpm)} BPM — your setting was kept`);
+          }
+        } else {
+          bpmDetectionRef.current = null;
+          setBpmDetection(null);
+          notify('Could not detect a steady tempo — set the BPM manually');
+        }
+      } catch (err) {
+        console.error('BPM detection failed:', err);
+      } finally {
+        detectingBpmRef.current = false;
+        setDetectingBpm(false);
+      }
+    },
+    [notify]
+  );
+
   // ---- WaveSurfer lifecycle --------------------------------------------------
   const initWaveSurfer = useCallback(
     async (file: File) => {
@@ -329,6 +373,10 @@ function App() {
       setLoadError(null);
       setLoadStage('reading');
       setExportState({ status: 'idle' });
+      setBpmDetection(null);
+      bpmDetectionRef.current = null;
+      setDetectingBpm(false);
+      bpmTouchedRef.current = false;
       setPlayingRegionId(null);
       previewRef.current = null;
       previewIdRef.current = null;
@@ -466,6 +514,9 @@ function App() {
 
       try {
         await ws.loadBlob(blob);
+        // Tempo detection is cheap (no deps, everything stays local). It runs
+        // after the waveform is up, so a ~50 ms analysis never delays first paint.
+        void runBpmDetection(audioBuffer);
       } catch (err) {
         console.error('WaveSurfer loadBlob error:', err);
         clearTimeout(loadTimeout);
@@ -474,7 +525,7 @@ function App() {
         notify('Failed to load audio.', 'error');
       }
     },
-    [applyLoop, notify]
+    [applyLoop, notify, runBpmDetection]
   );
 
   // ---- File handling ---------------------------------------------------------
@@ -544,6 +595,10 @@ function App() {
     setPlayingRegionId(null);
     setAbSlots({ a: null, b: null });
     setActiveSlot(null);
+    setBpmDetection(null);
+    bpmDetectionRef.current = null;
+    setDetectingBpm(false);
+    bpmTouchedRef.current = false;
     colorCounterRef.current = 0;
     previewRef.current = null;
     previewIdRef.current = null;
@@ -1379,11 +1434,32 @@ function App() {
                     max={300}
                     step={1}
                     value={bpm}
-                    onChange={(e) => setBpm(clamp(Number(e.target.value) || 120, 20, 300))}
+                    onChange={(e) => {
+                      setBpm(clamp(Number(e.target.value) || 120, 20, 300));
+                      bpmTouchedRef.current = true;
+                      bpmDetectionRef.current = null;
+                      setBpmDetection(null);
+                    }}
                     className="field field-mono w-16 text-right text-xs"
                     aria-label="Tempo in BPM for the beat grid"
                   />
                   <span className="font-mono text-[10px] text-slate-500">BPM</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (audioBufferRef.current) void runBpmDetection(audioBufferRef.current, true);
+                    }}
+                    disabled={!audioBufferRef.current || detectingBpm}
+                    title={
+                      bpmDetection
+                        ? `Detected ~${Math.round(bpmDetection.bpm)} BPM — click to re-run`
+                        : 'Estimate the tempo from the audio'
+                    }
+                    className="btn !py-1.5 text-slate-400"
+                  >
+                    <Timer size={14} aria-hidden />
+                    {detectingBpm ? 'Detecting…' : 'Detect'}
+                  </button>
                 </label>
               )}
             </div>
